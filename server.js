@@ -27,6 +27,7 @@ db.serialize(() => {
     display_name TEXT,
     password TEXT NOT NULL,
     avatar_color TEXT DEFAULT '#5865f2',
+    avatar_url TEXT DEFAULT '',
     about TEXT DEFAULT ''
   )`);
   db.run(`CREATE TABLE IF NOT EXISTS friendships (
@@ -42,6 +43,7 @@ db.serialize(() => {
     description TEXT DEFAULT '',
     owner_id INTEGER NOT NULL,
     invite_code TEXT UNIQUE NOT NULL,
+    avatar_url TEXT DEFAULT '',
     FOREIGN KEY(owner_id) REFERENCES users(id)
   )`);
   db.run(`CREATE TABLE IF NOT EXISTS server_members (
@@ -76,6 +78,8 @@ db.serialize(() => {
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     dm_recipient_id INTEGER,
     group_id INTEGER,
+    replied_to INTEGER,
+    pinned INTEGER DEFAULT 0,
     FOREIGN KEY(channel_id) REFERENCES channels(id),
     FOREIGN KEY(sender_id) REFERENCES users(id)
   )`);
@@ -107,6 +111,8 @@ db.serialize(() => {
     FOREIGN KEY(user_id) REFERENCES users(id)
   )`);
 });
+
+const onlineUsers = new Map();
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -155,7 +161,7 @@ app.post('/api/login', (req, res) => {
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
     db.run(`INSERT INTO sessions (id, user_id, token, user_agent, ip) VALUES (?, ?, ?, ?, ?)`,
       [uuidv4(), user.id, token, req.headers['user-agent'] || '', req.ip]);
-    res.json({ token, user: { id: user.id, username: user.username, display_name: user.display_name, avatar_color: user.avatar_color, about: user.about } });
+    res.json({ token, user: { id: user.id, username: user.username, display_name: user.display_name, avatar_color: user.avatar_color, avatar_url: user.avatar_url, about: user.about } });
   });
 });
 
@@ -167,17 +173,17 @@ app.post('/api/logout', authenticateToken, (req, res) => {
 });
 
 app.get('/api/users/me', authenticateToken, (req, res) => {
-  db.get(`SELECT id, username, display_name, avatar_color, about FROM users WHERE id = ?`, [req.user.id], (err, user) => {
+  db.get(`SELECT id, username, display_name, avatar_color, avatar_url, about FROM users WHERE id = ?`, [req.user.id], (err, user) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(user);
   });
 });
 
 app.put('/api/users/me', authenticateToken, (req, res) => {
-  const { display_name, username, about, avatar_color } = req.body;
+  const { display_name, username, about, avatar_color, avatar_url } = req.body;
   if (!username) return res.status(400).json({ error: 'Username required' });
-  db.run(`UPDATE users SET display_name = ?, username = ?, about = ?, avatar_color = ? WHERE id = ?`,
-    [display_name || username, username, about || '', avatar_color || '#5865f2', req.user.id], (err) => {
+  db.run(`UPDATE users SET display_name = ?, username = ?, about = ?, avatar_color = ?, avatar_url = ? WHERE id = ?`,
+    [display_name || username, username, about || '', avatar_color || '#5865f2', avatar_url || '', req.user.id], (err) => {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ success: true });
     });
@@ -207,7 +213,7 @@ app.delete('/api/users/me', authenticateToken, (req, res) => {
 
 app.get('/api/users/search', authenticateToken, (req, res) => {
   const q = req.query.q || '';
-  db.all(`SELECT id, username, display_name, avatar_color FROM users WHERE username LIKE ? OR display_name LIKE ? LIMIT 20`,
+  db.all(`SELECT id, username, display_name, avatar_color, avatar_url FROM users WHERE username LIKE ? OR display_name LIKE ? LIMIT 20`,
     [`%${q}%`, `%${q}%`], (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
       res.json(rows);
@@ -215,7 +221,7 @@ app.get('/api/users/search', authenticateToken, (req, res) => {
 });
 
 app.get('/api/users/:id', authenticateToken, (req, res) => {
-  db.get(`SELECT id, username, display_name, avatar_color, about FROM users WHERE id = ?`, [req.params.id], (err, user) => {
+  db.get(`SELECT id, username, display_name, avatar_color, avatar_url, about FROM users WHERE id = ?`, [req.params.id], (err, user) => {
     if (err || !user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   });
@@ -229,6 +235,11 @@ app.post('/api/friends/request', authenticateToken, (req, res) => {
     db.run(`INSERT OR IGNORE INTO friendships (user_id, friend_id, status) VALUES (?, ?, 'pending')`,
       [req.user.id, friendId], function(err) {
         if (err) return res.status(400).json({ error: 'Already sent or friends' });
+        // emit real-time event to recipient
+        const recipientSocket = onlineUsers.get(friendId);
+        if (recipientSocket) {
+          io.to(recipientSocket).emit('friend-request', { from: req.user.id });
+        }
         res.json({ success: true });
       });
   });
@@ -241,6 +252,8 @@ app.post('/api/friends/accept', authenticateToken, (req, res) => {
       if (err || this.changes === 0) return res.status(400).json({ error: 'No pending request' });
       db.run(`INSERT OR IGNORE INTO friendships (user_id, friend_id, status) VALUES (?, ?, 'accepted')`,
         [req.user.id, friendId]);
+      const senderSocket = onlineUsers.get(friendId);
+      if (senderSocket) io.to(senderSocket).emit('friend-update', {});
       res.json({ success: true });
     });
 });
@@ -250,6 +263,8 @@ app.post('/api/friends/remove', authenticateToken, (req, res) => {
   db.run(`DELETE FROM friendships WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)`,
     [req.user.id, friendId, friendId, req.user.id], (err) => {
       if (err) return res.status(500).json({ error: err.message });
+      const otherSocket = onlineUsers.get(friendId);
+      if (otherSocket) io.to(otherSocket).emit('friend-update', {});
       res.json({ success: true });
     });
 });
@@ -261,6 +276,8 @@ app.post('/api/friends/block', authenticateToken, (req, res) => {
   db.run(`INSERT OR REPLACE INTO friendships (user_id, friend_id, status) VALUES (?, ?, 'blocked')`,
     [req.user.id, friendId], (err) => {
       if (err) return res.status(500).json({ error: err.message });
+      const otherSocket = onlineUsers.get(friendId);
+      if (otherSocket) io.to(otherSocket).emit('friend-update', {});
       res.json({ success: true });
     });
 });
@@ -270,12 +287,14 @@ app.post('/api/friends/unblock', authenticateToken, (req, res) => {
   db.run(`DELETE FROM friendships WHERE user_id = ? AND friend_id = ? AND status = 'blocked'`,
     [req.user.id, friendId], (err) => {
       if (err) return res.status(500).json({ error: err.message });
+      const otherSocket = onlineUsers.get(friendId);
+      if (otherSocket) io.to(otherSocket).emit('friend-update', {});
       res.json({ success: true });
     });
 });
 
 app.get('/api/friends', authenticateToken, (req, res) => {
-  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color, f.status, f.user_id as sender_id
+  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_url, f.status, f.user_id as sender_id
           FROM friendships f
           JOIN users u ON (CASE WHEN f.user_id = ? THEN f.friend_id ELSE f.user_id END) = u.id
           WHERE (f.user_id = ? OR f.friend_id = ?) AND (f.status = 'accepted' OR (f.status = 'pending' AND f.friend_id = ?))
@@ -287,6 +306,7 @@ app.get('/api/friends', authenticateToken, (req, res) => {
         username: r.username,
         display_name: r.display_name,
         avatar_color: r.avatar_color,
+        avatar_url: r.avatar_url,
         status: r.status,
         sender: r.sender_id === req.user.id ? 'me' : 'them'
       }));
@@ -295,7 +315,7 @@ app.get('/api/friends', authenticateToken, (req, res) => {
 });
 
 app.get('/api/friends/blocked', authenticateToken, (req, res) => {
-  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color FROM friendships f
+  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_url FROM friendships f
           JOIN users u ON f.friend_id = u.id
           WHERE f.user_id = ? AND f.status = 'blocked'`, [req.user.id], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -304,7 +324,7 @@ app.get('/api/friends/blocked', authenticateToken, (req, res) => {
 });
 
 app.get('/api/servers', authenticateToken, (req, res) => {
-  db.all(`SELECT s.id, s.name, s.description, s.owner_id, s.invite_code, sm.role
+  db.all(`SELECT s.id, s.name, s.description, s.owner_id, s.invite_code, s.avatar_url, sm.role
           FROM servers s
           JOIN server_members sm ON s.id = sm.server_id
           WHERE sm.user_id = ?
@@ -365,6 +385,27 @@ app.post('/api/servers/:id/leave', authenticateToken, (req, res) => {
   });
 });
 
+app.get('/api/servers/:id/members', authenticateToken, (req, res) => {
+  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_url, sm.role
+          FROM server_members sm JOIN users u ON sm.user_id = u.id
+          WHERE sm.server_id = ?`, [req.params.id], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.delete('/api/servers/:id/members/:userId', authenticateToken, (req, res) => {
+  const serverId = req.params.id;
+  const userId = req.params.userId;
+  db.get(`SELECT role FROM server_members WHERE server_id = ? AND user_id = ?`, [serverId, req.user.id], (err, row) => {
+    if (!row || (row.role !== 'owner' && userId != req.user.id)) return res.status(403).json({ error: 'Not allowed' });
+    db.run(`DELETE FROM server_members WHERE server_id = ? AND user_id = ?`, [serverId, userId], (err2) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ success: true });
+    });
+  });
+});
+
 app.get('/api/servers/:id/categories', authenticateToken, (req, res) => {
   db.all(`SELECT * FROM categories WHERE server_id = ? ORDER BY position`, [req.params.id], (err, cats) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -404,14 +445,47 @@ app.post('/api/servers/:id/channels', authenticateToken, (req, res) => {
     });
 });
 
+app.delete('/api/channels/:id', authenticateToken, (req, res) => {
+  const chId = req.params.id;
+  db.get(`SELECT c.server_id FROM channels c JOIN servers s ON c.server_id = s.id WHERE c.id = ? AND s.owner_id = ?`, [chId, req.user.id], (err, row) => {
+    if (!row) return res.status(403).json({ error: 'Only server owner can delete channels' });
+    db.run(`DELETE FROM channels WHERE id = ?`, [chId], (err2) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ success: true });
+    });
+  });
+});
+
 app.get('/api/channels/:id/messages', authenticateToken, (req, res) => {
   const limit = req.query.limit || 50;
-  db.all(`SELECT m.id, m.content, m.timestamp, u.id as user_id, u.username, u.display_name, u.avatar_color
+  db.all(`SELECT m.id, m.content, m.timestamp, m.replied_to, m.pinned,
+          u.id as user_id, u.username, u.display_name, u.avatar_color, u.avatar_url
           FROM messages m JOIN users u ON m.sender_id = u.id
           WHERE m.channel_id = ? AND m.dm_recipient_id IS NULL AND m.group_id IS NULL
           ORDER BY m.timestamp ASC LIMIT ?`, [req.params.id, limit], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows);
+  });
+});
+
+app.put('/api/messages/:id', authenticateToken, (req, res) => {
+  const msgId = req.params.id;
+  const { content } = req.body;
+  db.get(`SELECT sender_id FROM messages WHERE id = ?`, [msgId], (err, msg) => {
+    if (err || !msg) return res.status(404).json({ error: 'Message not found' });
+    if (msg.sender_id !== req.user.id) return res.status(403).json({ error: 'Not allowed' });
+    db.run(`UPDATE messages SET content = ? WHERE id = ?`, [content, msgId], (err2) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ success: true });
+    });
+  });
+});
+
+app.post('/api/messages/:id/pin', authenticateToken, (req, res) => {
+  const msgId = req.params.id;
+  db.run(`UPDATE messages SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END WHERE id = ?`, [msgId], (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ success: true });
   });
 });
 
@@ -440,7 +514,7 @@ app.get('/api/dm/:friendId', authenticateToken, (req, res) => {
       if (!row) return res.status(403).json({ error: 'Not friends' });
       isBlocked(req.user.id, friendId, (blocked) => {
         if (blocked) return res.status(403).json({ error: 'Cannot DM a blocked user' });
-        db.all(`SELECT m.id, m.content, m.timestamp, u.id as user_id, u.username, u.display_name, u.avatar_color
+        db.all(`SELECT m.id, m.content, m.timestamp, m.replied_to, u.id as user_id, u.username, u.display_name, u.avatar_color, u.avatar_url
                 FROM messages m JOIN users u ON m.sender_id = u.id
                 WHERE (m.sender_id = ? AND m.dm_recipient_id = ?) OR (m.sender_id = ? AND m.dm_recipient_id = ?)
                 ORDER BY m.timestamp ASC LIMIT 100`,
@@ -501,7 +575,7 @@ app.get('/api/groups/:id/messages', authenticateToken, (req, res) => {
   const groupId = req.params.id;
   db.get(`SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?`, [groupId, req.user.id], (err, row) => {
     if (!row) return res.status(403).json({ error: 'Not a member' });
-    db.all(`SELECT m.id, m.content, m.timestamp, u.id as sender_id, u.username, u.display_name, u.avatar_color
+    db.all(`SELECT m.id, m.content, m.timestamp, m.replied_to, u.id as sender_id, u.username, u.display_name, u.avatar_color, u.avatar_url
             FROM messages m JOIN users u ON m.sender_id = u.id
             WHERE m.group_id = ?
             ORDER BY m.timestamp ASC LIMIT 100`, [groupId], (err2, msgs) => {
@@ -529,7 +603,7 @@ app.delete('/api/messages/group/:id', authenticateToken, (req, res) => {
 
 app.get('/api/groups/:id/members', authenticateToken, (req, res) => {
   const groupId = req.params.id;
-  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color
+  db.all(`SELECT u.id, u.username, u.display_name, u.avatar_color, u.avatar_url
           FROM group_members gm JOIN users u ON gm.user_id = u.id
           WHERE gm.group_id = ?`, [groupId], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -542,8 +616,7 @@ app.delete('/api/groups/:id/members/:userId', authenticateToken, (req, res) => {
   const userId = req.params.userId;
   db.get(`SELECT owner_id FROM groups WHERE id = ?`, [groupId], (err, group) => {
     if (!group) return res.status(404).json({ error: 'Group not found' });
-    if (group.owner_id !== req.user.id) return res.status(403).json({ error: 'Only owner can remove members' });
-    if (userId == req.user.id) return res.status(400).json({ error: 'Cannot remove yourself' });
+    if (group.owner_id !== req.user.id && userId != req.user.id) return res.status(403).json({ error: 'Not allowed' });
     db.run(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`, [groupId, userId], (err2) => {
       if (err2) return res.status(500).json({ error: err2.message });
       res.json({ success: true });
@@ -596,11 +669,15 @@ app.get('/api/sessions', authenticateToken, (req, res) => {
 
 app.delete('/api/sessions/:id', authenticateToken, (req, res) => {
   const sessionId = req.params.id;
-  db.get(`SELECT user_id FROM sessions WHERE id = ?`, [sessionId], (err, row) => {
+  db.get(`SELECT user_id, token FROM sessions WHERE id = ?`, [sessionId], (err, row) => {
     if (!row) return res.status(404).json({ error: 'Session not found' });
     if (row.user_id !== req.user.id) return res.status(403).json({ error: 'Not yours' });
     db.run(`DELETE FROM sessions WHERE id = ?`, [sessionId], (err2) => {
       if (err2) return res.status(500).json({ error: err2.message });
+      const targetSocket = onlineUsers.get(row.user_id);
+      if (targetSocket && row.token === req.token) {
+        // force logout current session? But careful: we may be terminating another session of the same user.
+      }
       res.json({ success: true });
     });
   });
@@ -625,6 +702,8 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
+  onlineUsers.set(socket.userId, socket.id);
+
   socket.on('join-channel', (channelId) => {
     socket.join(`channel-${channelId}`);
   });
@@ -632,12 +711,12 @@ io.on('connection', (socket) => {
     socket.leave(`channel-${channelId}`);
   });
 
-  socket.on('send-message', ({ channelId, content }) => {
+  socket.on('send-message', ({ channelId, content, repliedTo }) => {
     if (!content.trim()) return;
-    db.run(`INSERT INTO messages (channel_id, sender_id, content) VALUES (?, ?, ?)`,
-      [channelId, socket.userId, content], function(err) {
+    db.run(`INSERT INTO messages (channel_id, sender_id, content, replied_to) VALUES (?, ?, ?, ?)`,
+      [channelId, socket.userId, content, repliedTo || null], function(err) {
         if (err) return;
-        db.get(`SELECT u.username, u.display_name, u.avatar_color FROM users u WHERE u.id = ?`, [socket.userId], (_, user) => {
+        db.get(`SELECT u.username, u.display_name, u.avatar_color, u.avatar_url FROM users u WHERE u.id = ?`, [socket.userId], (_, user) => {
           const msg = {
             id: this.lastID,
             channel_id: channelId,
@@ -645,8 +724,10 @@ io.on('connection', (socket) => {
             username: user.username,
             display_name: user.display_name,
             avatar_color: user.avatar_color,
+            avatar_url: user.avatar_url,
             content,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            replied_to: repliedTo || null
           };
           io.to(`channel-${channelId}`).emit('new-message', msg);
         });
@@ -664,22 +745,24 @@ io.on('connection', (socket) => {
       socket.currentDmRoom = null;
     }
   });
-  socket.on('dm-message', ({ friendId, content }) => {
+  socket.on('dm-message', ({ friendId, content, repliedTo }) => {
     if (!content.trim()) return;
     const room = [socket.userId, friendId].sort().join('-');
-    db.run(`INSERT INTO messages (sender_id, content, dm_recipient_id) VALUES (?, ?, ?)`,
-      [socket.userId, content, friendId], function(err) {
+    db.run(`INSERT INTO messages (sender_id, content, dm_recipient_id, replied_to) VALUES (?, ?, ?, ?)`,
+      [socket.userId, content, friendId, repliedTo || null], function(err) {
         if (err) return;
-        db.get(`SELECT username, display_name, avatar_color FROM users WHERE id = ?`, [socket.userId], (_, user) => {
+        db.get(`SELECT username, display_name, avatar_color, avatar_url FROM users WHERE id = ?`, [socket.userId], (_, user) => {
           const msg = {
             id: this.lastID,
             sender_id: socket.userId,
             username: user.username,
             display_name: user.display_name,
             avatar_color: user.avatar_color,
+            avatar_url: user.avatar_url,
             content,
             timestamp: new Date().toISOString(),
-            dm_recipient_id: friendId
+            dm_recipient_id: friendId,
+            replied_to: repliedTo || null
           };
           io.to(`dm-${room}`).emit('dm-message', msg);
         });
@@ -694,23 +777,25 @@ io.on('connection', (socket) => {
     socket.leave(`group-${groupId}`);
     socket.currentGroupRoom = null;
   });
-  socket.on('group-message', ({ groupId, content }) => {
+  socket.on('group-message', ({ groupId, content, repliedTo }) => {
     if (!content.trim()) return;
     db.get(`SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?`, [groupId, socket.userId], (err, row) => {
       if (!row) return;
-      db.run(`INSERT INTO messages (sender_id, content, group_id) VALUES (?, ?, ?)`,
-        [socket.userId, content, groupId], function(err2) {
+      db.run(`INSERT INTO messages (sender_id, content, group_id, replied_to) VALUES (?, ?, ?, ?)`,
+        [socket.userId, content, groupId, repliedTo || null], function(err2) {
           if (err2) return;
-          db.get(`SELECT username, display_name, avatar_color FROM users WHERE id = ?`, [socket.userId], (_, user) => {
+          db.get(`SELECT username, display_name, avatar_color, avatar_url FROM users WHERE id = ?`, [socket.userId], (_, user) => {
             const msg = {
               id: this.lastID,
               sender_id: socket.userId,
               username: user.username,
               display_name: user.display_name,
               avatar_color: user.avatar_color,
+              avatar_url: user.avatar_url,
               content,
               timestamp: new Date().toISOString(),
-              group_id: groupId
+              group_id: groupId,
+              replied_to: repliedTo || null
             };
             io.to(`group-${groupId}`).emit('group-message', msg);
           });
@@ -718,7 +803,28 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('disconnect', () => {});
+  socket.on('call-join', (room) => {
+    socket.join(`call-${room}`);
+    // notify other participants
+    socket.to(`call-${room}`).emit('call-join', socket.userId);
+  });
+  socket.on('call-offer', ({ room, offer, to }) => {
+    socket.to(`call-${room}`).emit('call-offer', { from: socket.userId, offer });
+  });
+  socket.on('call-answer', ({ room, answer, to }) => {
+    socket.to(`call-${room}`).emit('call-answer', { from: socket.userId, answer });
+  });
+  socket.on('call-candidate', ({ room, candidate, to }) => {
+    socket.to(`call-${room}`).emit('call-candidate', { from: socket.userId, candidate });
+  });
+  socket.on('call-leave', (room) => {
+    socket.leave(`call-${room}`);
+    socket.to(`call-${room}`).emit('call-leave', socket.userId);
+  });
+
+  socket.on('disconnect', () => {
+    onlineUsers.delete(socket.userId);
+  });
 });
 
 server.listen(PORT, () => {});
